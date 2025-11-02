@@ -3,3 +3,6 @@ train_data.csv
 libraries.txt
 exceldraw/
 recomendations.py
+data/
+hack_env/
+.DS_Store

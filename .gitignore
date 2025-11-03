@@ -5,3 +5,4 @@ data/
 hack_env/
 .DS_Store
 processing copy.ipynb
+.env

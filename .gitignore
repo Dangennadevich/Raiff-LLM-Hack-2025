@@ -6,3 +6,5 @@ hack_env/
 .DS_Store
 processing copy.ipynb
 .env
+train_data.csv
+questions.csv

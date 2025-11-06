@@ -449,8 +449,8 @@ def get_similarities_datasets(query_512, query_1024, hnsw_index_t, hnsw_index_an
     return df_text_result, df_tags_annot_result_agg
 
 def prepare_rag_text(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
-    # Холдер для аннотации, если будет пример, где нет чанка (по бд текст), но есть документ - тогда берем аннотацию
-    str_annot_to_rag = ''
+    # Холдер для аннотации
+    annotation_doc_id = ''
 
     # Соберем единый датасет
     df_for_sort = df_text_result.merge(
@@ -466,24 +466,63 @@ def prepare_rag_text(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
     # Единый скор и сортировка, оставляем топ SK чанков
     df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
-    target_text_chunk = df_for_sort.loc[:SK, ['top_k_indices_text', 'doc_id']]
+    target_text_chunk = df_for_sort.reset_index(drop=True).loc[:SK-1, ['top_k_indices_text', 'doc_id']]
 
-    # Првоеряем попала ли аннотация в текст, если да - добавим ее позже
-    if (target_text_chunk['top_k_indices_text'].isna()).any(): # Соберем аннотации в str_annot_to_rag - если есть пропуск
-        annot_to_rag = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()]['doc_id'].unique()
-        str_annot_to_rag = '\n'.join(raw_data[raw_data['id'].isin(annot_to_rag)]['annotation'].values.tolist())
+    # NEW - индексы для чанков по тексту
+    target_text_chunk_notna = target_text_chunk[~target_text_chunk['top_k_indices_text'].isna()]
 
     # Собираем чанки текста из storage_t
-    rag_message = [storage_t[key][1] for key in target_text_chunk['top_k_indices_text'] if key >= 0]
+    rag_message = [storage_t[key][1] for key in target_text_chunk_notna['top_k_indices_text']]
     rag_message = '\n'.join(rag_message)
 
-    # Добавим анотацию, если только она попала в топ без чанка текста
-    if str_annot_to_rag:
-        rag_message = rag_message + f'\n{str_annot_to_rag}'
+    # Если есть doc_id без чанка, добавим анотацию doc_id 
+    if (target_text_chunk['top_k_indices_text'].isna()).any(): # Убрать
+        annotation_doc_id = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()].loc[0, 'doc_id'] # Получаем doc_id у пропущенного значения 
+        annotation_missed_chunk = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+        rag_message += f"\nАннотация: {annotation_missed_chunk}"
 
-    rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+    # Добавим анатацию самого сонаправленного doc_id
+    if annotation_doc_id != target_text_chunk.loc[0, 'doc_id']:
+        annotation_doc_id = target_text_chunk.loc[0, 'doc_id']
+        annotation_top1 = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+        rag_message += f"\nАннотация: {annotation_top1}"
 
-    return rag_text_for_llm
+# def prepare_rag_text_v1(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
+#     # Холдер для аннотации, если будет пример, где нет чанка (по бд текст), но есть документ - тогда берем аннотацию
+#     str_annot_to_rag = ''
+
+#     # Соберем единый датасет
+#     df_for_sort = df_text_result.merge(
+#         df_tags_annot_result_agg, 
+#         on='doc_id', 
+#         how='outer'
+#         )
+
+#     # Заполним пропуски в скорах
+#     df_for_sort['cos_scores_m'] = df_for_sort['cos_scores_m'].fillna(0)
+#     df_for_sort['cos_scores_ka_m'] = df_for_sort['cos_scores_ka_m'].fillna(0)
+
+#     # Единый скор и сортировка, оставляем топ SK чанков
+#     df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
+#     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
+#     target_text_chunk = df_for_sort.loc[:SK, ['top_k_indices_text', 'doc_id']]
+
+#     # Првоеряем попала ли аннотация в текст, если да - добавим ее позже
+#     if (target_text_chunk['top_k_indices_text'].isna()).any(): # Соберем аннотации в str_annot_to_rag - если есть пропуск
+#         annot_to_rag = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()]['doc_id'].unique()
+#         str_annot_to_rag = '\n'.join(raw_data[raw_data['id'].isin(annot_to_rag)]['annotation'].values.tolist())
+
+#     # Собираем чанки текста из storage_t
+#     rag_message = [storage_t[key][1] for key in target_text_chunk['top_k_indices_text'] if key >= 0]
+#     rag_message = '\n'.join(rag_message)
+
+#     # Добавим анотацию, если только она попала в топ без чанка текста
+#     if str_annot_to_rag:
+#         rag_message = rag_message + f'\n{str_annot_to_rag}'
+
+#     rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+
+#     return rag_text_for_llm
 
 def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an_t, raw_data):
 
@@ -519,9 +558,10 @@ def answer_generation(question):
 
     system_prompt = """Ты RAG-ассистент, вежливый помошник по банковским, финансовым и прочим вопросам. 
     Пользователь задает тебе вопрос с указанием ответить на него (Ответь на вопрос:). 
-    Так же в сообщении пользователя будет указана информация, которую ты должен использовать для ответа.
-    Отвечай открыто и интересно, по возможности приводи примеры!
-    Начинай с приветсвия пользователя!"""
+    Так же в сообщении пользователя будет указана информация, которую ты должен использовать для ответа (RAG базы данных).
+    Отвечай открыто и интересно, по возможности приводи примеры, основанные на знаниях из RAG базы данных!
+    Начинай с приветсвия пользователя!
+    Не повторяй вопрос пользователя!"""
 
     # Формируем запрос к клиенту
     response = client.chat.completions.create(

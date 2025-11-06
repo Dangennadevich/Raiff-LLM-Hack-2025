@@ -1,8 +1,10 @@
+from collections import Counter, defaultdict
 from scipy.special import expit
 from dotenv import load_dotenv
 from openai import OpenAI
 from typing import Any
 from tqdm import tqdm
+
 
 import pandas as pd
 import numpy as np
@@ -10,6 +12,8 @@ import tiktoken
 import logging
 import pickle
 import faiss
+import math
+import re
 import os
 
 load_dotenv() 
@@ -22,6 +26,13 @@ TAGS_ANNOTATIONS_CHUNK_SIZE = 256
 
 TEXT_OVERLAP = 0.2
 TAGS_ANNOTATIONS_OVERLAP = 0.75
+
+BM25_TOPK = 10
+BM25_KOEF = 0.2
+
+EMBED_KA_KOEF = 0.15
+
+EMBED_T_KOEF = 0.65
 
 K = 10 # Топ K при поиске в faiss
 SK = 7 # Топ K документов для RAG
@@ -345,6 +356,85 @@ def normalize_vector(embedding: np.ndarray) -> np.ndarray:
 
     return embedding
 
+# | -- | -- | -- | -- | -- | -- |  BM25 | -- | -- | -- | -- | -- | -- |
+
+# ---------------------------
+# 1) Токенизация
+# ---------------------------
+def tokenize(text):
+    text = text.lower()
+    tokens = re.findall(r"[a-zа-я0-9]+", text)
+    return tokens
+
+# ---------------------------
+# 2) Построение индекса
+# docs — список строк (документов)
+# ---------------------------
+class BM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.docs = [tokenize(doc) for doc in docs]
+        self.N = len(self.docs)
+
+        # длина документа
+        self.doc_lengths = [len(doc) for doc in self.docs]
+        self.avgDL = sum(self.doc_lengths) / self.N
+
+        # TF-грамматика: list[Counter]
+        self.tf = [Counter(doc) for doc in self.docs]
+
+        # DF: количество документов, где встречается слово
+        df = defaultdict(int)
+        for doc in self.docs:
+            for word in set(doc):
+                df[word] += 1
+
+        # IDF
+        self.idf = {}
+        for word, freq in df.items():
+            # Okapi IDF с защитой от отрицательности
+            self.idf[word] = math.log(1 + (self.N - freq + 0.5) / (freq + 0.5))
+
+    # ---------------------------
+    # 3) Счёт BM25 для одного документа
+    # ---------------------------
+    def score(self, query, index):
+        query_tokens = tokenize(query)
+        score = 0.0
+        doc_tf = self.tf[index]
+        doc_len = self.doc_lengths[index]
+
+        for term in query_tokens:
+            if term not in doc_tf:
+                continue
+            tf = doc_tf[term]
+            idf = self.idf.get(term, 0)
+
+            denom = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avgDL)
+            score += idf * (tf * (self.k1 + 1)) / denom
+
+        return score
+
+    # ---------------------------
+    # 4) Поиск top-k
+    # ---------------------------
+    def search(self, query, top_k=5):
+        scores = [(i, self.score(query, i)) for i in range(self.N)]
+        scores = sorted(scores, key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+    
+
+def bm25_screach(query:str, bm25, BM25_TOPK:int = BM25_TOPK):
+    bm25_results = bm25.search(query, top_k=BM25_TOPK)
+
+    bm25_results = pd.DataFrame(
+        bm25_results,
+        columns=['top_k_indices_text', 'bm25_score']
+        )
+    
+    return bm25_results
+
 # | -- | -- | -- | -- | -- | -- |  Работа с моделями | -- | -- | -- | -- | -- | -- |
 
 def get_embedding(text, dimensions=512):
@@ -415,6 +505,27 @@ def get_question_embeddings(user_query:str):
 
     return example_1024, example_512
 
+def get_similarities_bm25(storage):
+    # Все наши документы (теги)
+    docs = list()
+    for _, val in storage.items():
+        docs.append(val[1])
+
+    bm25 = BM25(docs)
+
+    bm25_results = bm25_screach(
+        query = "В чем минусы и плюсы доверительного управления?",
+        bm25=bm25
+    )
+
+    # Датасет в рамках которого будем крутить скоры
+    bm25_results['doc_id'] = bm25_results['top_k_indices_text'].apply(lambda idx: storage_t[idx][0])
+    # Номрализуем косинусную близость - чам больше - тем ближе, т.е. лучше
+    bm25_results['bm25_score'] = z_logistic(bm25_results[['bm25_score']]) * BM25_KOEF
+
+    return bm25_results
+
+
 def get_similarities_datasets(query_512, query_1024, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an_t, K=K):
     # Топ K вопросов по тексту
     top_k_similarities_text, top_k_indices_text = hnsw_index_t.search(np.array([query_1024], dtype=np.float32), K) # В БД Tags+annotation ищем пример
@@ -431,7 +542,7 @@ def get_similarities_datasets(query_512, query_1024, hnsw_index_t, hnsw_index_an
     # Номрализуем косинусную близость - чам больше - тем ближе, т.е. лучше
     df_text_result['cos_scores_m'] = z_logistic(df_text_result[['cos_scores']]) 
     # Взвешиваем скор
-    df_text_result['cos_scores_m'] = df_text_result['cos_scores_m'] * 0.8
+    df_text_result['cos_scores_m'] = df_text_result['cos_scores_m'] * EMBED_T_KOEF
 
     ## tags_annot
     df_tags_annot_result = pd.DataFrame({
@@ -444,11 +555,11 @@ def get_similarities_datasets(query_512, query_1024, hnsw_index_t, hnsw_index_an
     # Номрализуем косинусную близость - чам больше - тем ближе, т.е. лучше
     df_tags_annot_result_agg['cos_scores_ka_m'] = z_logistic(df_tags_annot_result_agg['cos_scores_ka'])
     # Взвешиваем скор
-    df_tags_annot_result_agg['cos_scores_ka_m'] = df_tags_annot_result_agg['cos_scores_ka_m'] * 0.2
+    df_tags_annot_result_agg['cos_scores_ka_m'] = df_tags_annot_result_agg['cos_scores_ka_m'] * EMBED_KA_KOEF
 
     return df_text_result, df_tags_annot_result_agg
 
-def prepare_rag_text(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
+def prepare_rag_text(df_text_result, df_tags_annot_result_agg, bm25_results, data, SK=SK):
     # Холдер для аннотации
     annotation_doc_id = ''
 
@@ -457,36 +568,94 @@ def prepare_rag_text(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
         df_tags_annot_result_agg, 
         on='doc_id', 
         how='outer'
+        ).merge(
+        bm25_results, 
+        on=['top_k_indices_text', 'doc_id'], 
+        how='outer'        
         )
 
     # Заполним пропуски в скорах
     df_for_sort['cos_scores_m'] = df_for_sort['cos_scores_m'].fillna(0)
     df_for_sort['cos_scores_ka_m'] = df_for_sort['cos_scores_ka_m'].fillna(0)
+    df_for_sort['bm25_score'] = df_for_sort['bm25_score'].fillna(0)
 
     # Единый скор и сортировка, оставляем топ SK чанков
-    df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
+    df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m'] + df_for_sort['bm25_score'] 
     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
     target_text_chunk = df_for_sort.reset_index(drop=True).loc[:SK-1, ['top_k_indices_text', 'doc_id']]
 
     # NEW - индексы для чанков по тексту
     target_text_chunk_notna = target_text_chunk[~target_text_chunk['top_k_indices_text'].isna()]
 
-    # Собираем чанки текста из storage_t
+    # # Собираем чанки текста из storage_t
     rag_message = [storage_t[key][1] for key in target_text_chunk_notna['top_k_indices_text']]
     rag_message = '\n'.join(rag_message)
 
-    # Если есть doc_id без чанка, добавим анотацию doc_id 
-    if (target_text_chunk['top_k_indices_text'].isna()).any(): # Убрать
-        annotation_doc_id = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()].loc[0, 'doc_id'] # Получаем doc_id у пропущенного значения 
-        annotation_missed_chunk = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+    # # Если есть doc_id без чанка, добавим анотацию doc_id 
+    if (target_text_chunk['top_k_indices_text'].isna()).any(): 
+        # Получаем doc_id у пропущенного значения 
+        annotation_doc_id = target_text_chunk[
+            target_text_chunk['top_k_indices_text'].isna()
+            ].reset_index()\
+            .loc[0, 'doc_id'] 
+        
+        annotation_missed_chunk = data[data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
         rag_message += f"\nАннотация: {annotation_missed_chunk}"
 
     # Добавим анатацию самого сонаправленного doc_id
     if annotation_doc_id != target_text_chunk.loc[0, 'doc_id']:
         annotation_doc_id = target_text_chunk.loc[0, 'doc_id']
-        annotation_top1 = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+        annotation_top1 = data[data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
         rag_message += f"\nАннотация: {annotation_top1}"
 
+    rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+
+    return rag_text_for_llm
+
+
+# def prepare_rag_text_v2(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
+#     # Холдер для аннотации
+#     annotation_doc_id = ''
+
+#     # Соберем единый датасет
+#     df_for_sort = df_text_result.merge(
+#         df_tags_annot_result_agg, 
+#         on='doc_id', 
+#         how='outer'
+#         )
+
+#     # Заполним пропуски в скорах
+#     df_for_sort['cos_scores_m'] = df_for_sort['cos_scores_m'].fillna(0)
+#     df_for_sort['cos_scores_ka_m'] = df_for_sort['cos_scores_ka_m'].fillna(0)
+
+#     # Единый скор и сортировка, оставляем топ SK чанков
+#     df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
+#     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
+#     target_text_chunk = df_for_sort.reset_index(drop=True).loc[:SK-1, ['top_k_indices_text', 'doc_id']]
+
+#     # NEW - индексы для чанков по тексту
+#     target_text_chunk_notna = target_text_chunk[~target_text_chunk['top_k_indices_text'].isna()]
+
+#     # Собираем чанки текста из storage_t
+#     rag_message = [storage_t[key][1] for key in target_text_chunk_notna['top_k_indices_text']]
+#     rag_message = '\n'.join(rag_message)
+
+#     # Если есть doc_id без чанка, добавим анотацию doc_id 
+#     if (target_text_chunk['top_k_indices_text'].isna()).any(): # Убрать
+#         annotation_doc_id = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()].loc[0, 'doc_id'] # Получаем doc_id у пропущенного значения 
+#         annotation_missed_chunk = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+#         rag_message += f"\nАннотация: {annotation_missed_chunk}"
+
+#     # Добавим анатацию самого сонаправленного doc_id
+#     if annotation_doc_id != target_text_chunk.loc[0, 'doc_id']:
+#         annotation_doc_id = target_text_chunk.loc[0, 'doc_id']
+#         annotation_top1 = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
+#         rag_message += f"\nАннотация: {annotation_top1}"
+
+#     rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+
+#     return rag_text_for_llm
+        
 # def prepare_rag_text_v1(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
 #     # Холдер для аннотации, если будет пример, где нет чанка (по бд текст), но есть документ - тогда берем аннотацию
 #     str_annot_to_rag = ''
@@ -524,10 +693,11 @@ def prepare_rag_text(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
 
 #     return rag_text_for_llm
 
-def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an_t, raw_data):
+def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an_t, data):
 
     query_1024, query_512 = get_question_embeddings(user_query)
 
+    bm25_results = get_similarities_bm25(storage=storage_t)
     df_text_result, df_tags_annot_result_agg = get_similarities_datasets(
         query_512=query_512, 
         query_1024=query_1024, 
@@ -540,7 +710,7 @@ def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an
     rag_text_for_llm = prepare_rag_text(
         df_text_result=df_text_result, 
         df_tags_annot_result_agg=df_tags_annot_result_agg, 
-        raw_data=raw_data
+        data=data
         )
 
     question = user_query + rag_text_for_llm
@@ -732,7 +902,7 @@ if __name__ == "__main__":
             hnsw_index_an_t=hnsw_index_an_t, 
             storage_t=storage_t, 
             storage_an_t=storage_an_t, 
-            raw_data=raw_data
+            data=data
             )
         logger.info(f"[__main__] prepared_question: {prepared_question}")
         # Отправляем запрос на генерацию ответа

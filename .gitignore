@@ -1,6 +1,5 @@
 libraries.txt
 exceldraw/
-recomendations.py
 data/
 hack_env/
 .DS_Store
@@ -9,3 +8,7 @@ processing copy.ipynb
 train_data.csv
 questions.csv
 submission.csv
+old_code.py
+submissions
+check_data.ipynb
+prepared_submissions

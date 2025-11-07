@@ -10,7 +10,10 @@ import pandas as pd
 import numpy as np
 import tiktoken
 import logging
+import time
 import pickle
+import requests
+import json
 import faiss
 import math
 import re
@@ -27,17 +30,22 @@ TAGS_ANNOTATIONS_CHUNK_SIZE = 256
 TEXT_OVERLAP = 0.2
 TAGS_ANNOTATIONS_OVERLAP = 0.75
 
-BM25_TOPK = 10
 BM25_KOEF = 0.2
-
 EMBED_KA_KOEF = 0.15
-
 EMBED_T_KOEF = 0.65
 
 K = 10 # Топ K при поиске в faiss
-SK = 7 # Топ K документов для RAG
+BM25_TOPK = 10 # Top k для BM25
+SK = 6 # Топ K документов для RAG
+KLLM = 6
 
 enc = tiktoken.get_encoding("cl100k_base")
+
+logging.basicConfig(
+    level=logging.INFO,                 # или DEBUG
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]  # вывод в консоль
+)
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +181,11 @@ def chunkinizer(
     tokens_question = enc.encode(question)
     # Количество токенов вопроса
     len_tokens_question = len(tokens_question)
+    # Избегаем ситуации с очень длинным вопросом
+    if len_tokens_question > chunk_size/2:
+        new_question_str_len = len(question)/2
+        tokens_question = enc.encode(question[:new_question_str_len])
+        len_tokens_question = len(tokens_question)
     # Размера чанка, который заполняется ответом
     answer_chunk_size = chunk_size - len_tokens_question
         
@@ -435,6 +448,65 @@ def bm25_screach(query:str, bm25, BM25_TOPK:int = BM25_TOPK):
     
     return bm25_results
 
+# | -- | -- | -- | -- | -- | -- |  Реранкер | -- | -- | -- | -- | -- | -- |
+
+def rerank_docs(query, documents, key):
+    # Базовый url - сохранять без изменения
+    url = "https://ai-for-finance-hack.up.railway.app/rerank"
+    # Формируем заголовок для запроса
+    headers = {
+        # Указываем тип получаемого контента
+        "Content-Type": "application/json",
+        # Указываем наш ключ, полученный ранее
+        "Authorization": f"Bearer {key}"
+    }
+    # Формируем сам запрос
+    payload = {
+        # Указываем модель
+        "model": "deepinfra/Qwen/Qwen3-Reranker-4B",
+        # Формируем текст запроса
+        "query": query,
+        # Добавляем документы для ранжирования
+        "documents": documents
+    }
+    # Отправляем запрос
+    response = requests.post(url, headers=headers, json=payload)
+    # Возвращаем результат запроса
+    return response.json()
+
+def reranker(user_query, message_for_rerank):
+    answer = {}
+    iter = 0
+
+    # Костыль т.к. реранкер выкидывает иногда 502 (раз в 150 итераций)
+    while 'results' not in answer:
+        answer = rerank_docs(
+            query=user_query,
+            documents=message_for_rerank,
+            key=EMBEDDER_API_KEY
+        )
+        if 'results' not in answer:
+            iter += 1
+            print(f'Error reranker! Iteration: {iter}, answer: {answer}')
+            time.sleep(2**iter)
+
+        if iter == 7:
+            break
+
+    result_metrics = [grade['relevance_score'] for grade in answer['results']]
+
+    final_sort = pd.DataFrame({
+        'score' : result_metrics, 
+        'text' : message_for_rerank
+    }).sort_values('score', ascending=False)\
+    .reset_index(drop=True)
+
+    rag_message = '\n'.join([x for x in final_sort.loc[:KLLM-1, 'text']])
+
+    rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+
+    return rag_text_for_llm
+
 # | -- | -- | -- | -- | -- | -- |  Работа с моделями | -- | -- | -- | -- | -- | -- |
 
 def get_embedding(text, dimensions=512):
@@ -589,7 +661,6 @@ def prepare_rag_text(df_text_result, df_tags_annot_result_agg, bm25_results, dat
 
     # # Собираем чанки текста из storage_t
     rag_message = [storage_t[key][1] for key in target_text_chunk_notna['top_k_indices_text']]
-    rag_message = '\n'.join(rag_message)
 
     # # Если есть doc_id без чанка, добавим анотацию doc_id 
     if (target_text_chunk['top_k_indices_text'].isna()).any(): 
@@ -600,98 +671,16 @@ def prepare_rag_text(df_text_result, df_tags_annot_result_agg, bm25_results, dat
             .loc[0, 'doc_id'] 
         
         annotation_missed_chunk = data[data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
-        rag_message += f"\nАннотация: {annotation_missed_chunk}"
+        rag_message.append(f"\nАннотация: {annotation_missed_chunk}")
 
     # Добавим анатацию самого сонаправленного doc_id
     if annotation_doc_id != target_text_chunk.loc[0, 'doc_id']:
         annotation_doc_id = target_text_chunk.loc[0, 'doc_id']
         annotation_top1 = data[data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
-        rag_message += f"\nАннотация: {annotation_top1}"
+        rag_message.append(f"\nАннотация: {annotation_top1}")
 
-    rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
+    return rag_message
 
-    return rag_text_for_llm
-
-
-# def prepare_rag_text_v2(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
-#     # Холдер для аннотации
-#     annotation_doc_id = ''
-
-#     # Соберем единый датасет
-#     df_for_sort = df_text_result.merge(
-#         df_tags_annot_result_agg, 
-#         on='doc_id', 
-#         how='outer'
-#         )
-
-#     # Заполним пропуски в скорах
-#     df_for_sort['cos_scores_m'] = df_for_sort['cos_scores_m'].fillna(0)
-#     df_for_sort['cos_scores_ka_m'] = df_for_sort['cos_scores_ka_m'].fillna(0)
-
-#     # Единый скор и сортировка, оставляем топ SK чанков
-#     df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
-#     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
-#     target_text_chunk = df_for_sort.reset_index(drop=True).loc[:SK-1, ['top_k_indices_text', 'doc_id']]
-
-#     # NEW - индексы для чанков по тексту
-#     target_text_chunk_notna = target_text_chunk[~target_text_chunk['top_k_indices_text'].isna()]
-
-#     # Собираем чанки текста из storage_t
-#     rag_message = [storage_t[key][1] for key in target_text_chunk_notna['top_k_indices_text']]
-#     rag_message = '\n'.join(rag_message)
-
-#     # Если есть doc_id без чанка, добавим анотацию doc_id 
-#     if (target_text_chunk['top_k_indices_text'].isna()).any(): # Убрать
-#         annotation_doc_id = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()].loc[0, 'doc_id'] # Получаем doc_id у пропущенного значения 
-#         annotation_missed_chunk = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
-#         rag_message += f"\nАннотация: {annotation_missed_chunk}"
-
-#     # Добавим анатацию самого сонаправленного doc_id
-#     if annotation_doc_id != target_text_chunk.loc[0, 'doc_id']:
-#         annotation_doc_id = target_text_chunk.loc[0, 'doc_id']
-#         annotation_top1 = raw_data[raw_data['id']==annotation_doc_id]['annotation'].values[0] # Аннотация пропущенного id
-#         rag_message += f"\nАннотация: {annotation_top1}"
-
-#     rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
-
-#     return rag_text_for_llm
-        
-# def prepare_rag_text_v1(df_text_result, df_tags_annot_result_agg, raw_data, SK=SK):
-#     # Холдер для аннотации, если будет пример, где нет чанка (по бд текст), но есть документ - тогда берем аннотацию
-#     str_annot_to_rag = ''
-
-#     # Соберем единый датасет
-#     df_for_sort = df_text_result.merge(
-#         df_tags_annot_result_agg, 
-#         on='doc_id', 
-#         how='outer'
-#         )
-
-#     # Заполним пропуски в скорах
-#     df_for_sort['cos_scores_m'] = df_for_sort['cos_scores_m'].fillna(0)
-#     df_for_sort['cos_scores_ka_m'] = df_for_sort['cos_scores_ka_m'].fillna(0)
-
-#     # Единый скор и сортировка, оставляем топ SK чанков
-#     df_for_sort['result_score'] = df_for_sort['cos_scores_m'] + df_for_sort['cos_scores_ka_m']
-#     df_for_sort = df_for_sort.sort_values('result_score', ascending=False)
-#     target_text_chunk = df_for_sort.loc[:SK, ['top_k_indices_text', 'doc_id']]
-
-#     # Првоеряем попала ли аннотация в текст, если да - добавим ее позже
-#     if (target_text_chunk['top_k_indices_text'].isna()).any(): # Соберем аннотации в str_annot_to_rag - если есть пропуск
-#         annot_to_rag = target_text_chunk[target_text_chunk['top_k_indices_text'].isna()]['doc_id'].unique()
-#         str_annot_to_rag = '\n'.join(raw_data[raw_data['id'].isin(annot_to_rag)]['annotation'].values.tolist())
-
-#     # Собираем чанки текста из storage_t
-#     rag_message = [storage_t[key][1] for key in target_text_chunk['top_k_indices_text'] if key >= 0]
-#     rag_message = '\n'.join(rag_message)
-
-#     # Добавим анотацию, если только она попала в топ без чанка текста
-#     if str_annot_to_rag:
-#         rag_message = rag_message + f'\n{str_annot_to_rag}'
-
-#     rag_text_for_llm = f'\n**Для ответа используй следующие знания из RAG базы данных**:\n{rag_message}'
-
-#     return rag_text_for_llm
 
 def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an_t, data):
 
@@ -707,11 +696,14 @@ def rag_screach(user_query, hnsw_index_t, hnsw_index_an_t, storage_t, storage_an
         storage_an_t=storage_an_t
     )
 
-    rag_text_for_llm = prepare_rag_text(
+    message_for_rerank = prepare_rag_text(
         df_text_result=df_text_result, 
         df_tags_annot_result_agg=df_tags_annot_result_agg, 
+        bm25_results=bm25_results,
         data=data
         )
+    
+    rag_text_for_llm = reranker(user_query, message_for_rerank=message_for_rerank)
 
     question = user_query + rag_text_for_llm
 
@@ -733,27 +725,58 @@ def answer_generation(question):
     Начинай с приветсвия пользователя!
     Не повторяй вопрос пользователя!"""
 
-    # Формируем запрос к клиенту
-    response = client.chat.completions.create(
-        # Выбираем любую допступную модель из предоставленного списка
-        model="openrouter/google/gemma-3-27b-it",
-        # Формируем сообщение
-        messages=[
+    # # Формируем запрос к клиенту
+    # response = client.chat.completions.create(
+    #     # Выбираем любую допступную модель из предоставленного списка
+    #     model="openrouter/google/gemma-3-27b-it",
+    #     # Формируем сообщение
+    #     messages=[
             
-                {"role": "system", "content": system_prompt},
-                {"role": "user", 
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Ответь на вопрос: {question}"
-                    }
-                ]}
-        ]
-    )
+    #             {"role": "system", "content": system_prompt},
+    #             {"role": "user", 
+    #             "content": [
+    #                 {
+    #                     "type": "text",
+    #                     "text": f"Ответь на вопрос: {question}"
+    #                 }
+    #             ]}
+    #     ]
+    # )
+
+
+    # Параметры
+    max_retries = 5
+    delay_base = 1  # Начальная задержка в секундах
+
+    # Формируем сообщение один раз, чтобы не дублировать
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [{"type": "text", "text": f"Ответь на вопрос: {question}"}]}
+    ]
+
+    response = None
+    for attempt in range(max_retries):
+        try:
+            # Формируем запрос к клиенту
+            response = client.chat.completions.create(
+                model="openrouter/google/gemma-3-27b-it",
+                messages=messages
+            )
+            model_responce = response.choices[0].message.content
+            break
+        except Exception as e:
+            print(f"Попытка {attempt + 1} не удалась: {e}")
+            if attempt < max_retries - 1:  # Не ждем после последней попытки
+                # Экспоненциальное откладывание (exponential backoff) + jitter
+                delay = delay_base * (2 ** attempt)
+                print(f"Ждем {delay:.2f} секунд перед следующей попыткой...")
+                time.sleep(delay)
+            else:
+                model_responce = ' '
+                print("Все попытки исчерпаны. Запрос не выполнен.")
+
     # Формируем ответ на запрос и возвращаем его в результате работы функции
-    return response.choices[0].message.content
-
-
+    return model_responce # response.choices[0].message.content
 
 # | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | 2. Подготовка данных | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = |
 
@@ -913,4 +936,4 @@ if __name__ == "__main__":
     # Добавляем в данные список ответов
     questions['Ответы на вопрос'] = answer_list
     # Сохраняем submission
-    questions.to_csv('submission.csv', index=False)
+    questions.to_csv('submission_rerank.csv', index=False)

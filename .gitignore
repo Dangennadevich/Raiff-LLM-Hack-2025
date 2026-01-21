@@ -12,3 +12,7 @@ old_code.py
 submissions
 check_data.ipynb
 prepared_submissions
+bin/
+.DS_Store
+hf_cache/
+submission_rerank.csv

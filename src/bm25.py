@@ -62,34 +62,34 @@ class BM25:
         return scores[:top_k]
     
 
-def bm25_screach(query:str, bm25, bm25_topk:int = BM25_TOPK):
-    bm25_results = bm25.search(query, top_k=bm25_topk)
+# def bm25_screach(query:str, bm25, bm25_topk:int = BM25_TOPK):
+#     bm25_results = bm25.search(query, top_k=bm25_topk)
 
-    bm25_results = pd.DataFrame(
-        bm25_results,
-        columns=['top_k_indices_text', 'bm25_score']
-        )
+#     bm25_results = pd.DataFrame(
+#         bm25_results,
+#         columns=['top_k_indices_text', 'bm25_score']
+#         )
     
-    return bm25_results
+#     return bm25_results
 
 
 
-def get_similarities_bm25(storage):
-    # Все наши документы (теги)
-    docs = list()
-    for _, val in storage.items():
-        docs.append(val[1])
+# def get_similarities_bm25(storage):
+#     # Все наши документы (теги)
+#     docs = list()
+#     for _, val in storage.items():
+#         docs.append(val[1])
 
-    bm25 = BM25(docs)
+#     bm25 = BM25(docs)
 
-    bm25_results = bm25_screach(
-        query = "В чем минусы и плюсы доверительного управления?",
-        bm25=bm25
-    )
+#     bm25_results = bm25_screach(
+#         query = "В чем минусы и плюсы доверительного управления?",
+#         bm25=bm25
+#     )
 
-    # Датасет в рамках которого будем крутить скоры
-    bm25_results['doc_id'] = bm25_results['top_k_indices_text'].apply(lambda idx: storage[idx][0])
-    # Номрализуем косинусную близость - чам больше - тем ближе, т.е. лучше
-    bm25_results['bm25_score'] = z_logistic(bm25_results[['bm25_score']]) * BM25_KOEF
+#     # Датасет в рамках которого будем крутить скоры
+#     bm25_results['doc_id'] = bm25_results['top_k_indices_text'].apply(lambda idx: storage[idx][0])
+#     # Номрализуем косинусную близость - чам больше - тем ближе, т.е. лучше
+#     bm25_results['bm25_score'] = z_logistic(bm25_results[['bm25_score']]) * BM25_KOEF
 
-    return bm25_results
+#     return bm25_results

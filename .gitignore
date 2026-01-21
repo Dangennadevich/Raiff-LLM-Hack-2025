@@ -16,3 +16,6 @@ bin/
 .DS_Store
 hf_cache/
 submission_rerank.csv
+__pycache__/
+*.py[cod]
+src/__init__.py

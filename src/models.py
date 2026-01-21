@@ -13,6 +13,7 @@ load_dotenv()
 LLM_API_KEY = os.getenv('LLM_API_KEY')
 EMBEDDER_API_KEY = os.getenv('EMBEDDER_API_KEY')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+
 EMBEDDER_MODEL_NAME = 'openai/text-embedding-3-small'
 
 

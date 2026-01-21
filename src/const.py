@@ -1,0 +1,22 @@
+TEXT_EMBEDDINGS_DIMENSIONS = 1536
+TEXT_CHUNK_SIZE = 425
+TEXT_OVERLAP = 0.25
+
+ANNOTATION_EMBEDDINGS_DIMENSIONS = 1536
+TAGS_ANNOTATIONS_CHUNK_SIZE = 256
+TAGS_ANNOTATIONS_OVERLAP = 0.05
+
+BM25_KOEF = 0.15
+EMBED_KA_KOEF = 0.15
+EMBED_T_KOEF = 0.7
+
+FAISS_ANNOTATION_K = 5 # Топ K при поиске в faiss
+FAISS_TEXT_K = 12 # Топ K при поиске в faiss
+BM25_TOPK = 8 # Top k для BM25
+TOP_K = 12 # Топ K документов для RAG
+KLLM = 6
+
+# Вес для скоров оценки релеватности чанков от разных стратегий
+BM25_WEIGHT = 0.2
+FAISS_TEXT = 0.65
+FAISS_TAGS_ANNOT = 0.15

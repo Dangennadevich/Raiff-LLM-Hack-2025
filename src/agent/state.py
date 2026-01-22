@@ -7,6 +7,7 @@ class RagChunk(TypedDict):
     score: Optional[float]
 
 class State(TypedDict):
+    session_id: str
     user_question: str
     rag_data: List[str] # RagChunk
 

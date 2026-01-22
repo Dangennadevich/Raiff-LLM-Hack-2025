@@ -1,19 +1,18 @@
-from src.agent.state import State
+from langchain_core.messages import SystemMessage, HumanMessage
 from src.agent.llm import llm_with_tools, llm_final_answer
+from src.agent.logging import get_node_logger
+from src.agent.state import State
 from src.rag import rag
 
-from langchain_core.messages import SystemMessage, HumanMessage
+import time
 
 def judge_step(state: State) -> State:
     """
     LLM определяет, достаточно ли текущих данных RAG.
     НЕОБХОДИМО вызвать инструмент judge_rag_sufficiency.
     """
-
-    # context_text = "\n\n".join(
-    #     f"[source={c['source']}] {c['text']}"
-    #     for c in state["rag_data"]
-    # )
+    start = time.perf_counter()
+    logger = get_node_logger("judge_step")
 
     context_text = "\n\n".join(
         f"{c}"
@@ -31,7 +30,7 @@ def judge_step(state: State) -> State:
 ⚠️ **Действуй согласно инструкции!**.
 ⚠️ **Не отвечай текстом!**
 """
-    print('----', 'judge_step')
+
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=f"""
@@ -45,10 +44,9 @@ def judge_step(state: State) -> State:
 
     # LLM выберет инструмент и заполнит его аргументы
     result = llm_with_tools.invoke(messages) 
-    print("result.tool_calls:", result.tool_calls)
-
+        
     if not result.tool_calls:
-        print('fallback: LLM не смог оценить')
+        logger.warning("LLM returned no tool calls, fallback activated")
         state["sufficient"] = False
         state["followup_query"] = state["user_question"]
         state["confidence"] = 0.0
@@ -61,13 +59,26 @@ def judge_step(state: State) -> State:
     state["followup_query"] = args.get("followup_query")
     state["confidence"] = args.get("confidence", 0.0)
 
+    duration = time.perf_counter() - start
+    logger.info(
+        "LLM tool call result",
+        extra={
+            "session_id": state.get("session_id"),
+            "tool_calls": result.tool_calls,
+            "duration_ms": round(duration * 1000, 2),
+        },
+    )
+
     return state
 
 def first_call_rag(state: State) -> State:
     """
     Retrieve new documents using followup_query
     """
-    print('----', 'first_call_rag')
+    start = time.perf_counter()
+    logger = get_node_logger("first_call_rag")
+
+    logger.info("first_call_rag entered")
 
     query = state["user_question"]
 
@@ -75,7 +86,17 @@ def first_call_rag(state: State) -> State:
 
     state["rag_data"].append(rag_answer)
     state["iteration"] += 1
-    print(state)
+
+    duration = time.perf_counter() - start
+    logger.info(
+        "First RAG result appended",
+        extra={
+            "session_id": state.get("session_id"),
+            "iteration": state["iteration"],
+            "rag_chunk_len": len(state["rag_data"][0]),
+            "duration_ms": round(duration * 1000, 2),
+        },
+    )
 
     return state
 
@@ -83,25 +104,44 @@ def rag_step(state: State) -> State:
     """
     Retrieve new documents using followup_query
     """
-    print('----', 'rag_step')
+    start = time.perf_counter()
+    logger = get_node_logger("rag_step")
 
+    # query = state["followup_query"] or state["user_question"]
     if state['iteration'] > 0:
         query = state["followup_query"]
     else:
         query = state["user_question"]
 
-    # 🔧 RAG 
+    logger.info(
+        "RAG query issued",
+        extra={
+            "session_id": state.get("session_id"),
+            "iteration": state["iteration"],
+            "query": query,
+        },
+    )
+
     rag_answer = rag(user_query=query)
 
-    cur_chunk = {
+    state["rag_data"].append({
         "text": rag_answer,
         "source": "rag_step",
         "query": query,
         "score": 1.0
-    }
-
-    state["rag_data"].append(cur_chunk)
+    })
     state["iteration"] += 1
+
+    duration = time.perf_counter() - start
+    logger.info(
+        "RAG result appended",
+        extra={
+            "session_id": state.get("session_id"),
+            "iteration": state["iteration"],
+            "rag_chunks": len(state["rag_data"]),
+            "duration_ms": round(duration * 1000, 2),
+        },
+    )
 
     return state
 
@@ -110,7 +150,8 @@ def final_answer_step(state: State) -> State:
     """
     Final answering LLM
     """
-    print('----', 'final_answer_step')
+    start = time.perf_counter()
+    logger = get_node_logger("final_answer_step")
 
     context_text = "\n\n".join(
         f"{c}"
@@ -135,4 +176,17 @@ def final_answer_step(state: State) -> State:
     answer = llm_final_answer.invoke(prompt)
 
     state["final_answer"] = answer.content
+
+    duration = time.perf_counter() - start
+    logger.info(
+        "Final answer generated",
+        extra={
+            "session_id": state.get("session_id"),
+            "rag_chunks": len(state["rag_data"]),
+            "confidence": state["confidence"],
+            "answer_length": len(state["final_answer"] or ""),
+            "duration_ms": round(duration * 1000, 2),
+        },
+    )
+
     return state

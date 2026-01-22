@@ -1,53 +1,78 @@
-from src.agent.graph import app
+from src.agent.schemas import ChatResponse, ChatRequest
+from src.agent.graph import app as agent_app
+from fastapi import FastAPI, HTTPException
+from uuid import uuid4
+
+from src.infra.logging import setup_logging
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,                 
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]  # вывод в консоль
+setup_logging()
+
+logger = logging.getLogger("rag-agent")
+logger.info("Application starting...")
+
+# FastAPI
+api = FastAPI(
+    title="Agentic RAG Service",
+    version="0.1.1",
 )
 
-logger = logging.getLogger(__name__)
+# Routes
+@api.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid4())
 
+    logger.info(
+        "Incoming request",
+        extra={
+            "session_id": session_id,
+            "user_question": req.message,
+        },
+    )
 
-# | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | 6. Call LLM | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = | = = |
+    initial_state = {
+        "session_id" : session_id,
+        "user_question": req.message,
+        "rag_data": [],
+        "sufficient": False,
+        "followup_query": None,
+        "confidence": 0.0,
+        "iteration": 0,
+        "max_iterations": 3,
+        "final_answer": None,
+    }
+
+    try:
+        state = agent_app.invoke(initial_state)
+    except Exception as e:
+        logger.exception("Agent execution failed")
+        raise HTTPException(status_code=500, detail="Agent execution failed")
+
+    logger.info(
+        "Agent finished",
+        extra={
+            "session_id": session_id,
+            "user_question": state.get("user_question"),
+            "rag_data": state.get("rag_data"),
+            "final_answer": state.get("final_answer"),
+            "iterations": state.get("iteration"),
+            "confidence": state.get("confidence"),
+        },
+    )
+
+    return ChatResponse(
+        session_id=session_id,
+        answer=state.get("final_answer"),
+        confidence=state.get("confidence", 0.0),
+        iterations=state.get("iteration", 0),
+    )
 
 if __name__ == "__main__":
-    import argparse
+    import uvicorn
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--interactive", action="store_true", help="Run interactive chat mode")
-    args = parser.parse_args()
-
-    logger.info("[__main__] Start...")
-
-    # === ИНТЕРАКТИВНЫЙ РЕЖИМ ===
-    print("⚡ Запущен интерактивный режим. Введите вопрос.")
-    print("Введите `exit` чтобы выйти.\n")
-
-    while True:
-        user_input = input("> ").strip()
-        if user_input.lower() in ["exit", "quit"]:
-            print("👋 Выход.")
-            break
-
-        initial_state = {
-            "user_question": user_input, # "Какие налоги уплачиваются с вклада?",
-            "rag_data": [],
-            "sufficient": False,
-            "followup_query": None,
-            "confidence": 0.0,
-            "iteration": 0,
-            "max_iterations": 3,
-            "final_answer": None,
-        }
-        # -------------------------
-        # 2. Запускаем graph
-        # -------------------------
-        state = app.invoke(initial_state)
-        # -------------------------
-        # 3. Проверяем результат
-        # -------------------------
-        logger.info("Финальное состояние агента:\n")
-        logger.info(state)
-        logger.info(f'\nAssistant:\n{state['final_answer']}\n')
+    uvicorn.run(
+        "src.main:api",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )

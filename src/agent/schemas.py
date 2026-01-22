@@ -1,0 +1,12 @@
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    answer: str | None
+    confidence: float
+    iterations: int
